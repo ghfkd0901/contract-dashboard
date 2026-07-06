@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import datetime
 from utils import load_contract_df, load_supply_df
 
 st.set_page_config(page_title="계약-공급 연계 현황", layout="wide")
@@ -14,12 +15,11 @@ if df_c.empty or df_s_raw.empty:
     st.error("데이터 로드 실패")
     st.stop()
 
-# 공급전 연월 추가 (utils에서 이미 처리됨)
-parsed_s = pd.to_datetime(df_s_raw["공급일"], errors="coerce")
-df_s_raw["연월_공급"] = parsed_s.dt.strftime("%Y-%m").where(parsed_s.notna(), df_s_raw["공급일"].astype(str).str[:7])
-
-# 계약전 연월 컬럼명 변경 (조인 구분용)
+# 계약전 연월 컬럼명 변경
 df_c["연월_계약"] = df_c["연월"]
+
+# 공급전 연월 컬럼
+df_s_raw["연월_공급"] = df_s_raw["연월"]
 
 # 공급전 컬럼 전체에 _공급 접미사 (공급신청번호 제외)
 df_s_renamed = df_s_raw.rename(columns={
@@ -31,23 +31,30 @@ df_s_renamed = df_s_raw.rename(columns={
 # ───────────────────────────────
 all_ym_c = sorted(df_c["연월_계약"].dropna().unique().tolist(), reverse=True)
 all_ym_s = sorted(df_s_raw["연월_공급"].dropna().unique().tolist(), reverse=True)
+current_year = str(datetime.datetime.now().year)
 
 with st.sidebar:
     st.header("🔍 조회 설정")
 
+    # 계약전 기간 — 기본값: 올해 1월 ~ 최신월
     st.markdown("#### 📋 계약전 기간 (공급신청일)")
+    default_start_c = f"{current_year}-01"
+    start_idx_c = all_ym_c.index(default_start_c) if default_start_c in all_ym_c else len(all_ym_c) - 1
     c1, c2 = st.columns(2)
     with c1:
-        start_c = st.selectbox("시작", all_ym_c, index=len(all_ym_c) - 1, key="start_c")
+        start_c = st.selectbox("시작", all_ym_c, index=start_idx_c, key="start_c")
     with c2:
         end_c = st.selectbox("종료", all_ym_c, index=0, key="end_c")
     if start_c > end_c:
         st.warning("⚠️ 시작이 종료보다 늦습니다")
 
+    # 공급전 기간 — 기본값: 올해 1월 ~ 최신월
     st.markdown("#### 🏠 공급전 기간 (공급일)")
+    default_start_s = f"{current_year}-01"
+    start_idx_s = all_ym_s.index(default_start_s) if default_start_s in all_ym_s else len(all_ym_s) - 1
     c3, c4 = st.columns(2)
     with c3:
-        start_s = st.selectbox("시작", all_ym_s, index=len(all_ym_s) - 1, key="start_s")
+        start_s = st.selectbox("시작", all_ym_s, index=start_idx_s, key="start_s")
     with c4:
         end_s = st.selectbox("종료", all_ym_s, index=0, key="end_s")
     if start_s > end_s:
