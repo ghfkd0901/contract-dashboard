@@ -111,7 +111,7 @@ if "시설분담금" in df_base.columns:
     ).fillna(0)
 
 def extract_ym(series):
-    parsed = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+    parsed = pd.to_datetime(series, errors="coerce")
     return parsed.dt.strftime("%Y-%m").where(parsed.notna(), series.astype(str).str[:7])
 
 df_base["연월"] = extract_ym(df_base["공급신청일"])
