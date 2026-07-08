@@ -36,17 +36,16 @@ current_year = str(datetime.datetime.now().year)
 with st.sidebar:
     st.header("🔍 조회 설정")
 
-    # 계약전 기간 — 기본값: 올해 1월 ~ 최신월
-    st.markdown("#### 📋 계약전 기간 (공급신청일)")
-    default_start_c = f"{current_year}-01"
-    start_idx_c = all_ym_c.index(default_start_c) if default_start_c in all_ym_c else len(all_ym_c) - 1
-    c1, c2 = st.columns(2)
-    with c1:
-        start_c = st.selectbox("시작", all_ym_c, index=start_idx_c, key="start_c")
-    with c2:
-        end_c = st.selectbox("종료", all_ym_c, index=0, key="end_c")
-    if start_c > end_c:
-        st.warning("⚠️ 시작이 종료보다 늦습니다")
+    # 계약전 연월 — 멀티셀렉트, 기본값: 가장 최근 연월
+    st.markdown("#### 📋 계약전 연월 (공급신청일)")
+    sel_ym_c = st.multiselect(
+        "연월 선택",
+        all_ym_c,
+        default=[all_ym_c[0]] if all_ym_c else [],
+        key="sel_ym_c"
+    )
+    if not sel_ym_c:
+        st.warning("⚠️ 최소 1개 이상의 연월을 선택하세요")
 
     # 공급전 기간 — 기본값: 올해 1월 ~ 최신월
     st.markdown("#### 🏠 공급전 기간 (공급일)")
@@ -99,7 +98,6 @@ with st.sidebar:
 # ───────────────────────────────
 # 필터 적용
 # ───────────────────────────────
-sel_ym_c = [ym for ym in all_ym_c if start_c <= ym <= end_c]
 sel_ym_s = [ym for ym in all_ym_s if start_s <= ym <= end_s]
 
 df_c_filtered = df_f5[df_f5["연월_계약"].isin(sel_ym_c)].copy()
@@ -124,8 +122,10 @@ incomplete = total - completed
 avg_days   = df_join["소요일수"].dropna().mean()
 rate       = completed / total * 100 if total > 0 else 0
 
+ym_c_label = ", ".join(sel_ym_c) if sel_ym_c else "선택 없음"
+
 st.markdown("### 📊 매칭 현황 요약")
-st.caption(f"계약전: {start_c} ~ {end_c}  |  공급전: {start_s} ~ {end_s}")
+st.caption(f"계약전: {ym_c_label}  |  공급전: {start_s} ~ {end_s}")
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("계약전 전체",   f"{total:,} 건")
@@ -188,11 +188,12 @@ def make_excel(df_all, df_done, df_undone) -> bytes:
     return output.getvalue()
 
 if not df_join.empty:
+    ym_c_file = "_".join(sel_ym_c) if len(sel_ym_c) <= 3 else f"{sel_ym_c[-1]}~{sel_ym_c[0]}"
     excel_bytes = make_excel(df_join, df_done, df_undone)
     download_placeholder.download_button(
         label="⬇️ 엑셀 다운로드",
         data=excel_bytes,
-        file_name=f"계약공급연계_{start_c}_{end_c}.xlsx",
+        file_name=f"계약공급연계_{ym_c_file}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
