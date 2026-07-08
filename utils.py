@@ -1,145 +1,137 @@
 import streamlit as st
 import pandas as pd
-import io
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from pathlib import Path
 
 VALID_STATES = ["공급계약", "공급승인"]
 
-@st.cache_resource
-def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/drive.readonly"]
-    )
-    return build('drive', 'v3', credentials=creds)
+# ───────────────────────────────
+# 데이터 폴더 / 파일 패턴
+# ───────────────────────────────
+DATA_DIR = Path(r"D:\Project\계약내역조회웹앱\data")
+CONTRACT_PATTERN = "계약전현황조회_*.csv"
+SUPPLY_PATTERN = "공급전현황조회_*.csv"
 
-def _download_latest_file(folder_id: str) -> pd.DataFrame:
-    drive_service = get_drive_service()
-    results = drive_service.files().list(
-        q=f"'{folder_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType, modifiedTime)",
-        orderBy="modifiedTime desc"
-    ).execute()
-    files = results.get("files", [])
+
+def _latest_file(pattern: str) -> Path | None:
+    """DATA_DIR 안에서 파일명 패턴에 맞는 파일 중 가장 최근에 수정된 파일 반환"""
+    files = list(DATA_DIR.glob(pattern))
     if not files:
-        return pd.DataFrame()
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime)
 
-    file = files[0]
-    mime = file.get("mimeType", "")
-    if "google-apps" in mime:
-        request = drive_service.files().export_media(fileId=file["id"], mimeType="text/csv")
-        encoding = "utf-8"
-    else:
-        request = drive_service.files().get_media(fileId=file["id"])
-        encoding = "cp949"
 
-    fh = io.BytesIO()
-    dl = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    fh.seek(0)
-
-    try:
-        df = pd.read_csv(fh, encoding=encoding, low_memory=False)
-    except UnicodeDecodeError:
-        fh.seek(0)
-        df = pd.read_csv(fh, encoding="utf-8-sig", low_memory=False)
-
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-@st.cache_data(ttl=600)
-def load_contract_df() -> pd.DataFrame:
-    try:
-        df = _download_latest_file(st.secrets["drive_folders"]["contract_view"])
-        if df.empty:
+def _read_csv_robust(path: Path) -> pd.DataFrame:
+    for enc in ("cp949", "utf-8-sig", "utf-8"):
+        try:
+            df = pd.read_csv(path, encoding=enc, low_memory=False)
+            df.columns = [c.strip() for c in df.columns]
             return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"인코딩을 확인할 수 없습니다: {path}")
 
-        # 집계 행 제거
-        first_col = df.columns[0]
-        df = df[~df[first_col].astype(str).str.contains("총 계|총계|총합계", na=False)].copy()
 
-        # 상태 필터
-        df["공급신청상태"] = df["공급신청상태"].astype(str).str.replace(" ", "").str.strip()
-        df = df[df["공급신청상태"].isin(VALID_STATES)].copy()
+# ───────────────────────────────
+# 원본 → 가공 로직 (기존 로직 그대로)
+# ───────────────────────────────
+def _process_contract(df: pd.DataFrame) -> pd.DataFrame:
+    first_col = df.columns[0]
+    df = df[~df[first_col].astype(str).str.contains("총 계|총계|총합계", na=False)].copy()
 
-        # 전수 파싱
-        df["전수"] = pd.to_numeric(
-            df["전수"].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce"
+    df["공급신청상태"] = df["공급신청상태"].astype(str).str.replace(" ", "").str.strip()
+    df = df[df["공급신청상태"].isin(VALID_STATES)].copy()
+
+    df["전수"] = pd.to_numeric(
+        df["전수"].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce"
+    ).fillna(0)
+
+    if "시설분담금" in df.columns:
+        df["시설분담금"] = pd.to_numeric(
+            df["시설분담금"].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce"
         ).fillna(0)
 
-        # 시설분담금 파싱
-        if "시설분담금" in df.columns:
-            df["시설분담금"] = pd.to_numeric(
-                df["시설분담금"].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce"
-            ).fillna(0)
+    parsed = pd.to_datetime(df["공급신청일"], errors="coerce")
+    df["연월"] = parsed.dt.strftime("%Y-%m").where(parsed.notna(), df["공급신청일"].astype(str).str[:7])
+    df["연도"] = df["연월"].str[:4]
+    df["월"] = df["연월"].str[5:7]
 
-        # 날짜 파싱
-        parsed = pd.to_datetime(df["공급신청일"], errors="coerce")
-        df["연월"] = parsed.dt.strftime("%Y-%m").where(parsed.notna(), df["공급신청일"].astype(str).str[:7])
-        df["연도"] = df["연월"].str[:4]
-        df["월"]   = df["연월"].str[5:7]
+    df["시군구"] = df["주소"].astype(str).str[:3].str.replace(" ", "")
+    df["시도"] = df["시군구"].apply(lambda x: "경북" if x in ["경산시", "고령군"] else "대구")
 
-        # 시군구 / 시도
-        df["시군구"] = df["주소"].astype(str).str[:3].str.replace(" ", "")
-        df["시도"]   = df["시군구"].apply(lambda x: "경북" if x in ["경산시", "고령군"] else "대구")
+    for col in ["계약구분", "상품명", "용도", "공급신청번호"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
 
-        # 문자열 정리
-        for col in ["계약구분", "상품명", "용도", "공급신청번호"]:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
+    return df
 
-        return df
 
+def _process_supply(df: pd.DataFrame) -> pd.DataFrame:
+    first_col = df.columns[0]
+    df = df[~df[first_col].astype(str).str.contains("계", na=False)].copy()
+
+    df["공급일"] = df["공급일"].astype(str).str.strip()
+    parsed = pd.to_datetime(df["공급일"], errors="coerce")
+    df["연월"] = parsed.dt.strftime("%Y-%m").where(parsed.notna(), df["공급일"].astype(str).str[:7])
+    df["연도"] = df["연월"].str[:4]
+    df["월"] = df["연월"].str[5:7]
+
+    df = df[df["월"].str.match(r"^\d{2}$", na=False)].copy()
+
+    df["시군구"] = df["주소"].astype(str).str[:3].str.replace(" ", "")
+    df["시도"] = df["시군구"].apply(lambda x: "경북" if x in ["경산시", "고령군"] else "대구")
+
+    월사용 = pd.to_numeric(
+        df["월 사용예정량"].astype(str).str.replace(",", "").str.strip(),
+        errors="coerce"
+    ).fillna(0)
+    등급 = pd.to_numeric(df["등급"], errors="coerce").fillna(0)
+    base = 월사용.where(월사용 > 1, 등급 * 0.6 * 10145 * 90 / 11000)
+    df["신규개발량"] = (base * 0.504).round(2)
+
+    for col in ["계약구분", "상품", "용도", "업종", "공급신청번호"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    return df
+
+
+# ───────────────────────────────
+# 캐시된 로더 (path + mtime을 키로 사용 → 파일이 바뀌면 자동 갱신)
+# ───────────────────────────────
+@st.cache_data(show_spinner="계약전 데이터 불러오는 중...")
+def _load_contract_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    df = _read_csv_robust(Path(path_str))
+    return _process_contract(df)
+
+
+@st.cache_data(show_spinner="공급전 데이터 불러오는 중...")
+def _load_supply_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    df = _read_csv_robust(Path(path_str))
+    return _process_supply(df)
+
+
+# ───────────────────────────────
+# 외부에서 호출하는 함수 (기존과 시그니처 동일)
+# ───────────────────────────────
+def load_contract_df() -> pd.DataFrame:
+    try:
+        f = _latest_file(CONTRACT_PATTERN)
+        if f is None:
+            st.error(f"❌ 계약전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / CONTRACT_PATTERN}")
+            return pd.DataFrame()
+        return _load_contract_cached(str(f), f.stat().st_mtime)
     except Exception as e:
         st.error(f"❌ 계약전 데이터 로드 실패: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600)
 def load_supply_df() -> pd.DataFrame:
     try:
-        df = _download_latest_file(st.secrets["drive_folders"]["supply_view"])
-        if df.empty:
-            return df
-
-        # 집계 행 제거
-        first_col = df.columns[0]
-        df = df[~df[first_col].astype(str).str.contains("계", na=False)].copy()
-
-        # 날짜 파싱
-        df["공급일"] = df["공급일"].astype(str).str.strip()
-        parsed = pd.to_datetime(df["공급일"], errors="coerce")
-        df["연월"] = parsed.dt.strftime("%Y-%m").where(parsed.notna(), df["공급일"].astype(str).str[:7])
-        df["연도"] = df["연월"].str[:4]
-        df["월"]   = df["연월"].str[5:7]
-
-        # 월 컬럼 정리
-        df = df[df["월"].str.match(r"^\d{2}$", na=False)].copy()
-
-        # 시군구 / 시도
-        df["시군구"] = df["주소"].astype(str).str[:3].str.replace(" ", "")
-        df["시도"]   = df["시군구"].apply(lambda x: "경북" if x in ["경산시", "고령군"] else "대구")
-
-        # ── 신규개발량 벡터화 계산 (apply 대신) ──────────────
-        월사용 = pd.to_numeric(
-            df["월 사용예정량"].astype(str).str.replace(",", "").str.strip(),
-            errors="coerce"
-        ).fillna(0)
-        등급 = pd.to_numeric(df["등급"], errors="coerce").fillna(0)
-        base = 월사용.where(월사용 > 1, 등급 * 0.6 * 10145 * 90 / 11000)
-        df["신규개발량"] = (base * 0.504).round(2)
-
-        # 문자열 정리
-        for col in ["계약구분", "상품", "용도", "업종", "공급신청번호"]:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
-
-        return df
-
+        f = _latest_file(SUPPLY_PATTERN)
+        if f is None:
+            st.error(f"❌ 공급전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / SUPPLY_PATTERN}")
+            return pd.DataFrame()
+        return _load_supply_cached(str(f), f.stat().st_mtime)
     except Exception as e:
         st.error(f"❌ 공급전 데이터 로드 실패: {e}")
         return pd.DataFrame()
