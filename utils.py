@@ -5,11 +5,18 @@ from pathlib import Path
 VALID_STATES = ["공급계약", "공급승인"]
 
 # ───────────────────────────────
-# 데이터 폴더 / 파일 패턴
+# 데이터 폴더 (utils.py 기준 상대경로 → 로컬/Streamlit Cloud 어디서든 동일하게 동작)
 # ───────────────────────────────
-DATA_DIR = Path(r"D:\Project\계약내역조회웹앱\data")
-CONTRACT_PATTERN = "계약전현황조회_*.csv"
-SUPPLY_PATTERN = "공급전현황조회_*.csv"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
+# 원본 CSV (용량이 크고 로컬에만 존재, git에는 안 올라감 — build_data.py 에서만 사용)
+RAW_CONTRACT_PATTERN = "계약전현황조회_*.csv"
+RAW_SUPPLY_PATTERN = "공급전현황조회_*.csv"
+
+# 앱이 실제로 읽는 가공된 Parquet (용량 작음, git에 커밋되어 클라우드에서도 접근 가능)
+CONTRACT_PARQUET_PATTERN = "계약전_*.parquet"
+SUPPLY_PARQUET_PATTERN = "공급전_*.parquet"
+MERGED_PARQUET_PATTERN = "계약공급연계_*.parquet"
 
 
 def _latest_file(pattern: str) -> Path | None:
@@ -32,7 +39,7 @@ def _read_csv_robust(path: Path) -> pd.DataFrame:
 
 
 # ───────────────────────────────
-# 원본 → 가공 로직 (기존 로직 그대로)
+# 원본 → 가공 로직 (build_data.py 에서 호출, 앱 실행 중에는 호출 안 됨)
 # ───────────────────────────────
 def _process_contract(df: pd.DataFrame) -> pd.DataFrame:
     first_col = df.columns[0]
@@ -95,51 +102,6 @@ def _process_supply(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ───────────────────────────────
-# 캐시된 로더 (path + mtime을 키로 사용 → 파일이 바뀌면 자동 갱신)
-# ───────────────────────────────
-@st.cache_data(show_spinner="계약전 데이터 불러오는 중...")
-def _load_contract_cached(path_str: str, mtime: float) -> pd.DataFrame:
-    df = _read_csv_robust(Path(path_str))
-    return _process_contract(df)
-
-
-@st.cache_data(show_spinner="공급전 데이터 불러오는 중...")
-def _load_supply_cached(path_str: str, mtime: float) -> pd.DataFrame:
-    df = _read_csv_robust(Path(path_str))
-    return _process_supply(df)
-
-
-# ───────────────────────────────
-# 외부에서 호출하는 함수 (기존과 시그니처 동일)
-# ───────────────────────────────
-def load_contract_df() -> pd.DataFrame:
-    try:
-        f = _latest_file(CONTRACT_PATTERN)
-        if f is None:
-            st.error(f"❌ 계약전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / CONTRACT_PATTERN}")
-            return pd.DataFrame()
-        return _load_contract_cached(str(f), f.stat().st_mtime)
-    except Exception as e:
-        st.error(f"❌ 계약전 데이터 로드 실패: {e}")
-        return pd.DataFrame()
-
-
-def load_supply_df() -> pd.DataFrame:
-    try:
-        f = _latest_file(SUPPLY_PATTERN)
-        if f is None:
-            st.error(f"❌ 공급전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / SUPPLY_PATTERN}")
-            return pd.DataFrame()
-        return _load_supply_cached(str(f), f.stat().st_mtime)
-    except Exception as e:
-        st.error(f"❌ 공급전 데이터 로드 실패: {e}")
-        return pd.DataFrame()
-
-
-# ───────────────────────────────
-# 계약전 + 공급전 머지 로직 (build_merged_data.py 에서 사용)
-# ───────────────────────────────
 def _build_merged(df_c: pd.DataFrame, df_s: pd.DataFrame) -> pd.DataFrame:
     df_c = df_c.copy()
     df_c["연월_계약"] = df_c["연월"]
@@ -161,29 +123,53 @@ def _build_merged(df_c: pd.DataFrame, df_s: pd.DataFrame) -> pd.DataFrame:
 
 
 # ───────────────────────────────
-# 미리 만들어둔 머지 결과(Parquet) 읽기 (앱에서는 merge를 아예 하지 않음)
-# build_merged_data.py를 실행하면 이 패턴의 파일이 생성됨
-# Parquet은 CSV보다 훨씬 작고(컬럼 압축) dtype도 그대로 보존되어 로드가 더 빠름
+# 앱이 실제로 사용하는 로더 — 전부 Parquet만 읽음 (CSV 읽기/가공/merge 전부 없음)
 # ───────────────────────────────
-MERGED_PATTERN = "계약공급연계_*.parquet"
-
-
-@st.cache_data(show_spinner="계약-공급 매칭 데이터 불러오는 중...")
-def _load_merged_cached(path_str: str, mtime: float) -> pd.DataFrame:
+@st.cache_data(show_spinner="데이터 불러오는 중...")
+def _load_parquet_cached(path_str: str, mtime: float) -> pd.DataFrame:
     return pd.read_parquet(path_str)
 
 
-def load_merged_df() -> pd.DataFrame:
-    """미리 만들어둔 계약-공급 머지 Parquet을 읽음 (merge 연산 없음, 파일 읽기만)"""
+def load_contract_df() -> pd.DataFrame:
     try:
-        f = _latest_file(MERGED_PATTERN)
+        f = _latest_file(CONTRACT_PARQUET_PATTERN)
         if f is None:
             st.error(
-                f"❌ 매칭 데이터 파일을 찾을 수 없습니다: {DATA_DIR / MERGED_PATTERN}\n"
-                "먼저 build_merged_data.py 를 실행해서 파일을 생성해주세요."
+                f"❌ 계약전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / CONTRACT_PARQUET_PATTERN}\n"
+                "로컬에서 build_data.py 를 실행해서 파일을 생성한 뒤 git push 해주세요."
             )
             return pd.DataFrame()
-        return _load_merged_cached(str(f), f.stat().st_mtime)
+        return _load_parquet_cached(str(f), f.stat().st_mtime)
+    except Exception as e:
+        st.error(f"❌ 계약전 데이터 로드 실패: {e}")
+        return pd.DataFrame()
+
+
+def load_supply_df() -> pd.DataFrame:
+    try:
+        f = _latest_file(SUPPLY_PARQUET_PATTERN)
+        if f is None:
+            st.error(
+                f"❌ 공급전 데이터 파일을 찾을 수 없습니다: {DATA_DIR / SUPPLY_PARQUET_PATTERN}\n"
+                "로컬에서 build_data.py 를 실행해서 파일을 생성한 뒤 git push 해주세요."
+            )
+            return pd.DataFrame()
+        return _load_parquet_cached(str(f), f.stat().st_mtime)
+    except Exception as e:
+        st.error(f"❌ 공급전 데이터 로드 실패: {e}")
+        return pd.DataFrame()
+
+
+def load_merged_df() -> pd.DataFrame:
+    try:
+        f = _latest_file(MERGED_PARQUET_PATTERN)
+        if f is None:
+            st.error(
+                f"❌ 매칭 데이터 파일을 찾을 수 없습니다: {DATA_DIR / MERGED_PARQUET_PATTERN}\n"
+                "로컬에서 build_data.py 를 실행해서 파일을 생성한 뒤 git push 해주세요."
+            )
+            return pd.DataFrame()
+        return _load_parquet_cached(str(f), f.stat().st_mtime)
     except Exception as e:
         st.error(f"❌ 매칭 데이터 로드 실패: {e}")
         return pd.DataFrame()
