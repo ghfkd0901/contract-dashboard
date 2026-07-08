@@ -135,3 +135,55 @@ def load_supply_df() -> pd.DataFrame:
     except Exception as e:
         st.error(f"❌ 공급전 데이터 로드 실패: {e}")
         return pd.DataFrame()
+
+
+# ───────────────────────────────
+# 계약전 + 공급전 머지 로직 (build_merged_data.py 에서 사용)
+# ───────────────────────────────
+def _build_merged(df_c: pd.DataFrame, df_s: pd.DataFrame) -> pd.DataFrame:
+    df_c = df_c.copy()
+    df_c["연월_계약"] = df_c["연월"]
+
+    df_s = df_s.copy()
+    df_s["연월_공급"] = df_s["연월"]
+    df_s_renamed = df_s.rename(columns={
+        col: f"{col}_공급" for col in df_s.columns if col != "공급신청번호"
+    })
+
+    df_join = df_c.merge(df_s_renamed, on="공급신청번호", how="left")
+
+    df_join["공급신청일"] = pd.to_datetime(df_join["공급신청일"], errors="coerce")
+    df_join["공급일_공급"] = pd.to_datetime(df_join["공급일_공급"], errors="coerce")
+    df_join["소요일수"] = (df_join["공급일_공급"] - df_join["공급신청일"]).dt.days
+    df_join["완료여부"] = df_join["공급일_공급"].notna().map({True: "✅ 완료", False: "⏳ 미완료"})
+
+    return df_join
+
+
+# ───────────────────────────────
+# 미리 만들어둔 머지 결과(Parquet) 읽기 (앱에서는 merge를 아예 하지 않음)
+# build_merged_data.py를 실행하면 이 패턴의 파일이 생성됨
+# Parquet은 CSV보다 훨씬 작고(컬럼 압축) dtype도 그대로 보존되어 로드가 더 빠름
+# ───────────────────────────────
+MERGED_PATTERN = "계약공급연계_*.parquet"
+
+
+@st.cache_data(show_spinner="계약-공급 매칭 데이터 불러오는 중...")
+def _load_merged_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    return pd.read_parquet(path_str)
+
+
+def load_merged_df() -> pd.DataFrame:
+    """미리 만들어둔 계약-공급 머지 Parquet을 읽음 (merge 연산 없음, 파일 읽기만)"""
+    try:
+        f = _latest_file(MERGED_PATTERN)
+        if f is None:
+            st.error(
+                f"❌ 매칭 데이터 파일을 찾을 수 없습니다: {DATA_DIR / MERGED_PATTERN}\n"
+                "먼저 build_merged_data.py 를 실행해서 파일을 생성해주세요."
+            )
+            return pd.DataFrame()
+        return _load_merged_cached(str(f), f.stat().st_mtime)
+    except Exception as e:
+        st.error(f"❌ 매칭 데이터 로드 실패: {e}")
+        return pd.DataFrame()
